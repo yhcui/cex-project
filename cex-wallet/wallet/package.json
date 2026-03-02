@@ -1,0 +1,53 @@
+{
+  "name": "wallet",
+  "version": "1.0.0",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "ts-node src/index.ts",
+    "dev:watch": "nodemon --exec ts-node src/index.ts",
+    "clean": "rm -rf dist",
+    "prebuild": "npm run clean",
+    "test": "ts-node tests/run-tests.ts",
+    "test:wallet": "ts-node tests/wallet.test.ts",
+    "deploy:erc20:tokens": "bash mock/deploy_erc20.sh",
+    "deploy:solana:tokens": "ts-node mock/deploySplTokens.ts",
+    "mock:init": "ts-node mock/mock_init_wallets_tokens.ts",
+    "mock:evm:transfer": "bash mock/transfer_token.sh",
+    "mock:solana:transfer": "ts-node mock/solanaTransferToWallets.ts",
+    "mock:withdraw:evm": "ts-node mock/requestWithdrawOnEVM.ts",
+    "mock:withdraw:black": "ts-node mock/requestWithdrawToBlackAddr.ts",
+    "mock:withdraw:needReview": "ts-node mock/requestWithdrawNeedReview.ts",
+    "mock:withdraw:solana": "ts-node mock/requestWithdrawOnSolana.ts",
+    "mock:withdraw:solana:sol": "ts-node mock/requestWithdrawOnSolana.ts SOL",
+    "mock:withdraw:solana:usdc": "ts-node mock/requestWithdrawOnSolana.ts USDC",
+    "mock:withdraw:solana:usdt": "ts-node mock/requestWithdrawOnSolana.ts USDT",
+    "mock:approveReview": "ts-node mock/mockApproveReview.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@solana-program/system": "^0.9.0",
+    "@solana-program/token": "^0.7.0",
+    "@solana/kit": "^4.0.0",
+    "@types/uuid": "^10.0.0",
+    "axios": "^1.12.2",
+    "dotenv": "^16.4.5",
+    "express": "^5.1.0",
+    "sqlite3": "^5.1.7",
+    "tweetnacl": "^1.0.3",
+    "uuid": "^13.0.0",
+    "viem": "^2.37.8"
+  },
+  "devDependencies": {
+    "@solana/spl-token": "^0.4.14",
+    "@solana/web3.js": "^1.98.4",
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.3.1",
+    "nodemon": "^3.1.10",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.2"
+  }
+}

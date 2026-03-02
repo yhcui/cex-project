@@ -1,0 +1,221 @@
+import { DatabaseConnection } from '../connection';
+
+// 交易接口定义
+export interface Transaction {
+  id?: number;
+  block_hash?: string;
+  block_no?: number;
+  tx_hash: string;
+  from_addr: string;
+  to_addr: string;
+  token_addr?: string;
+  amount: string;
+  type: 'deposit' | 'withdraw' | 'collect' | 'rebalance';
+  status: 'pending' | 'confirmed' | 'failed';
+  created_at?: string;
+}
+
+// 创建交易请求接口
+export interface CreateTransactionRequest {
+  block_hash?: string;
+  block_no?: number;
+  tx_hash: string;
+  from_addr: string;
+  to_addr: string;
+  token_addr?: string;
+  amount: string;
+  type: 'deposit' | 'withdraw' | 'collect' | 'rebalance';
+  status?: 'pending' | 'confirmed' | 'failed';
+}
+
+// 交易更新接口
+export interface UpdateTransactionRequest {
+  status?: 'pending' | 'confirmed' | 'failed';
+  amount?: string;
+}
+
+// 交易查询选项
+export interface TransactionQueryOptions {
+  from_addr?: string;
+  to_addr?: string;
+  token_addr?: string;
+  type?: 'deposit' | 'withdraw' | 'collect' | 'rebalance';
+  status?: 'pending' | 'confirmed' | 'failed';
+  limit?: number | undefined;
+  offset?: number | undefined;
+  orderBy?: 'created_at' | 'amount' | 'type' | 'block_no';
+  orderDirection?: 'ASC' | 'DESC';
+}
+
+// 交易数据模型类
+export class TransactionModel {
+  private db: DatabaseConnection;
+
+  constructor(database: DatabaseConnection) {
+    this.db = database;
+  }
+
+  // 根据ID查找交易
+  async findById(id: number): Promise<Transaction | null> {
+    const transaction = await this.db.queryOne<Transaction>(
+      'SELECT * FROM transactions WHERE id = ?',
+      [id]
+    );
+    return transaction || null;
+  }
+
+  // 根据交易哈希查找交易
+  async findByHash(tx_hash: string): Promise<Transaction | null> {
+    const transaction = await this.db.queryOne<Transaction>(
+      'SELECT * FROM transactions WHERE tx_hash = ?',
+      [tx_hash]
+    );
+    return transaction || null;
+  }
+
+  // 根据地址获取交易记录
+  async findByAddress(address: string, options?: TransactionQueryOptions): Promise<Transaction[]> {
+    let sql = 'SELECT * FROM transactions WHERE from_addr = ? OR to_addr = ?';
+    const params: any[] = [address, address];
+
+    // 添加过滤条件
+    if (options?.type) {
+      sql += ' AND type = ?';
+      params.push(options.type);
+    }
+
+    if (options?.status) {
+      sql += ' AND status = ?';
+      params.push(options.status);
+    }
+
+    // 添加排序
+    const orderBy = options?.orderBy || 'created_at';
+    const orderDirection = options?.orderDirection || 'DESC';
+    sql += ` ORDER BY ${orderBy} ${orderDirection}`;
+
+    // 添加分页
+    if (options?.limit) {
+      sql += ' LIMIT ?';
+      params.push(options.limit);
+      
+      if (options?.offset) {
+        sql += ' OFFSET ?';
+        params.push(options.offset);
+      }
+    }
+
+    return await this.db.query<Transaction>(sql, params);
+  }
+
+  // 获取用户充值中的余额（confirmed 和 safe 状态的 deposit 交易，处理decimals并格式化）
+  async getUserPendingDepositBalances(user_id: number): Promise<{
+    token_symbol: string;
+    pending_amount: string;
+    transaction_count: number;
+  }[]> {
+    const sql = `
+      SELECT 
+        CASE 
+          WHEN t.token_addr IS NULL THEN 'ETH'
+          ELSE COALESCE(tk.token_symbol, 'UNKNOWN')
+        END as token_symbol,
+        SUM(CAST(t.amount AS REAL)) as raw_amount,
+        COALESCE(tk.decimals, 18) as decimals,
+        COUNT(*) as transaction_count
+      FROM transactions t
+      LEFT JOIN wallets w ON t.to_addr = w.address
+      LEFT JOIN tokens tk ON t.token_addr = tk.token_address
+      WHERE w.user_id = ? 
+        AND t.type = 'deposit' 
+        AND t.status IN ('confirmed', 'safe')
+      GROUP BY token_symbol, tk.decimals
+      HAVING raw_amount > 0
+      ORDER BY raw_amount DESC
+    `;
+    
+    const rows = await this.db.query<{
+      token_symbol: string;
+      raw_amount: number;
+      decimals: number;
+      transaction_count: number;
+    }>(sql, [user_id]);
+
+    return rows.map(row => ({
+      token_symbol: row.token_symbol,
+      pending_amount: (row.raw_amount / Math.pow(10, row.decimals)).toFixed(6),
+      transaction_count: row.transaction_count
+    }));
+  }
+
+  // 获取所有交易
+  async findAll(options?: TransactionQueryOptions): Promise<Transaction[]> {
+    let sql = 'SELECT * FROM transactions WHERE 1=1';
+    const params: any[] = [];
+
+    // 添加过滤条件
+    if (options?.from_addr) {
+      sql += ' AND from_addr = ?';
+      params.push(options.from_addr);
+    }
+
+    if (options?.to_addr) {
+      sql += ' AND to_addr = ?';
+      params.push(options.to_addr);
+    }
+
+    if (options?.token_addr) {
+      sql += ' AND token_addr = ?';
+      params.push(options.token_addr);
+    }
+
+    if (options?.type) {
+      sql += ' AND type = ?';
+      params.push(options.type);
+    }
+
+    if (options?.status) {
+      sql += ' AND status = ?';
+      params.push(options.status);
+    }
+
+    // 添加排序
+    const orderBy = options?.orderBy || 'created_at';
+    const orderDirection = options?.orderDirection || 'DESC';
+    sql += ` ORDER BY ${orderBy} ${orderDirection}`;
+
+    // 添加分页
+    if (options?.limit) {
+      sql += ' LIMIT ?';
+      params.push(options.limit);
+      
+      if (options?.offset) {
+        sql += ' OFFSET ?';
+        params.push(options.offset);
+      }
+    }
+
+    return await this.db.query<Transaction>(sql, params);
+  }
+
+  // 检查交易是否存在
+  async exists(id: number): Promise<boolean> {
+    const result = await this.db.queryOne<{ count: number }>(
+      'SELECT COUNT(*) as count FROM transactions WHERE id = ?',
+      [id]
+    );
+    
+    return (result?.count || 0) > 0;
+  }
+
+  // 检查交易哈希是否已存在
+  async hashExists(tx_hash: string): Promise<boolean> {
+    const result = await this.db.queryOne<{ count: number }>(
+      'SELECT COUNT(*) as count FROM transactions WHERE tx_hash = ?',
+      [tx_hash]
+    );
+    
+    return (result?.count || 0) > 0;
+  }
+
+}

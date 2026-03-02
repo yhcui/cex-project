@@ -1,0 +1,519 @@
+import { Request, Response, NextFunction } from 'express';
+import { Ed25519Verifier } from '../utils/crypto';
+import { GatewayRequest, SignaturePayload, BatchGatewayRequest } from '../types';
+import { logger } from '../utils/logger';
+import { OperationIdService } from '../services/operation-id';
+import { DatabaseService } from '../services/database';
+import { isSensitiveOperation, getSensitiveReason } from '../config/sensitive-tables';
+
+export interface AuthenticatedRequest extends Request {
+  gatewayRequest?: GatewayRequest;
+  batchGatewayRequest?: BatchGatewayRequest;
+  signaturePayload?: SignaturePayload;
+}
+
+export class SignatureMiddleware {
+  private verifier: Ed25519Verifier;
+  private operationIdService: OperationIdService;
+
+  constructor(dbService: DatabaseService) {
+    this.verifier = new Ed25519Verifier();
+    this.operationIdService = new OperationIdService(dbService);
+  }
+
+  validateRequest = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    try {
+      const gatewayRequest = req.body as GatewayRequest;
+
+      // 验证必要字段
+      if (!gatewayRequest.operation_id ||
+          !gatewayRequest.operation_type ||
+          !gatewayRequest.table ||
+          !gatewayRequest.action ||
+          !gatewayRequest.business_signature ||
+          !gatewayRequest.timestamp ) {
+        return res.status(400).json({
+          success: false,
+          error: {
+            code: 'INVALID_REQUEST',
+            message: 'Missing required fields',
+            details: 'operation_id, operation_type, table, action, business_signature, timestamp, and module are required'
+          }
+        });
+      }
+
+      // 强制规则：敏感表的写操作必须标记为敏感操作
+      if (isSensitiveOperation(gatewayRequest.table, gatewayRequest.action)) {
+        if (gatewayRequest.operation_type !== 'sensitive') {
+          const reason = getSensitiveReason(gatewayRequest.table);
+          logger.warn('Non-sensitive operation attempted on sensitive table', {
+            operation_id: gatewayRequest.operation_id,
+            table: gatewayRequest.table,
+            action: gatewayRequest.action
+          });
+
+          return res.status(400).json({
+            success: false,
+            error: {
+              code: 'INVALID_OPERATION_TYPE',
+              message: `Operation on ${gatewayRequest.table} table must be sensitive`,
+              details: `${gatewayRequest.action.toUpperCase()} on ${gatewayRequest.table} requires operation_type: 'sensitive'. Reason: ${reason}`
+            }
+          });
+        }
+      }
+
+      // 验证时间戳（1分钟窗口）
+      const now = Date.now();
+      const requestTime = gatewayRequest.timestamp;
+      const timeDiff = Math.abs(now - requestTime);
+      const maxTimeDiff = 60 * 1000; // 60 seconds
+
+      if (timeDiff > maxTimeDiff) {
+        return res.status(400).json({
+          success: false,
+          error: {
+            code: 'TIMESTAMP_EXPIRED',
+            message: 'Request timestamp is too old or too far in the future',
+            details: `Time difference: ${timeDiff}ms, max allowed: ${maxTimeDiff}ms`
+          }
+        });
+      }
+
+      // 验证operation_id作为nonce（防重放攻击）
+      const isOperationIdValid = await this.operationIdService.validateAndRecordOperationId(
+        gatewayRequest.operation_id,
+        gatewayRequest.timestamp
+      );
+
+      if (!isOperationIdValid) {
+        logger.warn('Operation ID validation failed - possible replay attack', {
+          operation_id: gatewayRequest.operation_id
+        });
+
+        return res.status(400).json({
+          success: false,
+          error: {
+            code: 'DUPLICATE_OPERATION_ID',
+            message: 'Operation ID has already been used',
+            details: 'This operation_id has already been used. Possible replay attack detected.'
+          }
+        });
+      }
+
+      req.gatewayRequest = gatewayRequest;
+      next();
+    } catch (error) {
+      logger.error('Request validation failed', { error, body: req.body });
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'REQUEST_VALIDATION_ERROR',
+          message: 'Failed to validate request',
+          details: error instanceof Error ? error.message : 'Unknown error'
+        }
+      });
+    }
+  };
+
+  verifyBusinessSignature = (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    try {
+      const gatewayRequest = req.gatewayRequest!;
+
+      const signaturePayload: SignaturePayload = {
+        operation_id: gatewayRequest.operation_id,
+        operation_type: gatewayRequest.operation_type,
+        table: gatewayRequest.table,
+        action: gatewayRequest.action,
+        data: gatewayRequest.data,
+        conditions: gatewayRequest.conditions,
+        timestamp: gatewayRequest.timestamp
+      };
+
+      // 验证业务签名（自动识别签名者）
+      const verificationResult = this.verifier.verifySignature(
+        signaturePayload,
+        gatewayRequest.business_signature
+      );
+
+      if (!verificationResult.valid) {
+        logger.warn('Business signature verification failed', {
+          operation_id: gatewayRequest.operation_id,
+          table: gatewayRequest.table,
+          action: gatewayRequest.action
+        });
+
+        return res.status(401).json({
+          success: false,
+          error: {
+            code: 'SIGNATURE_VERIFICATION_FAILED',
+            message: 'Business signature verification failed',
+            details: 'The provided signature is invalid'
+          }
+        });
+      }
+
+      req.signaturePayload = signaturePayload;
+      logger.info('Business signature verified successfully', {
+        operation_id: gatewayRequest.operation_id,
+        signer: verificationResult.signer  // 记录签名者
+      });
+
+      next();
+    } catch (error) {
+      logger.error('Signature verification error', { error, operation_id: req.gatewayRequest?.operation_id });
+      return res.status(500).json({
+        success: false,
+        error: {
+          code: 'SIGNATURE_VERIFICATION_ERROR',
+          message: 'Failed to verify signature',
+          details: error instanceof Error ? error.message : 'Unknown error'
+        }
+      });
+    }
+  };
+
+  verifyRiskControlSignature = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    try {
+      const gatewayRequest = req.gatewayRequest!;
+      const signaturePayload = req.signaturePayload!;
+
+      // 检查是否需要风控签名（敏感操作）
+      if (gatewayRequest.operation_type === 'sensitive') {
+        // 1. 验证必需字段 - 敏感操作必须有风控签名
+        if (!gatewayRequest.risk_signature) {
+          logger.error('Missing risk signature for sensitive operation', {
+            operation_id: gatewayRequest.operation_id,
+            table: gatewayRequest.table,
+            action: gatewayRequest.action
+          });
+
+          return res.status(400).json({
+            success: false,
+            error: {
+              code: 'MISSING_RISK_SIGNATURE',
+              message: 'Risk signature is required for sensitive operations',
+              details: 'Sensitive operations must include risk_signature field'
+            }
+          });
+        }
+
+        // 2. 检查风控系统是否有配置的公钥
+        if (!this.verifier.hasPublicKey('risk')) {
+          return res.status(500).json({
+            success: false,
+            error: {
+              code: 'NO_RISK_PUBLIC_KEY',
+              message: 'No public key configured for risk control system',
+              details: 'Risk control public key must be configured in environment variables'
+            }
+          });
+        }
+
+        // 3. 创建签名负载
+        const riskSignaturePayload: SignaturePayload = {
+          operation_id: gatewayRequest.operation_id,
+          operation_type: gatewayRequest.operation_type,
+          table: gatewayRequest.table,
+          action: gatewayRequest.action,
+          data: gatewayRequest.data,
+          conditions: gatewayRequest.conditions,
+          timestamp: gatewayRequest.timestamp
+        };
+
+        // 4. 验证风控签名（指定 risk 签名者）
+        const riskVerificationResult = this.verifier.verifySignature(
+          riskSignaturePayload,
+          gatewayRequest.risk_signature,
+          'risk'  // 指定预期签名者为 risk，避免遍历所有公钥
+        );
+
+        if (!riskVerificationResult.valid) {
+          logger.warn('Risk control signature verification failed', {
+            operation_id: gatewayRequest.operation_id,
+            table: gatewayRequest.table,
+            action: gatewayRequest.action
+          });
+
+          return res.status(401).json({
+            success: false,
+            error: {
+              code: 'RISK_SIGNATURE_VERIFICATION_FAILED',
+              message: 'Risk control signature verification failed',
+              details: 'The provided risk signature is invalid'
+            }
+          });
+        }
+
+        logger.info('Risk control signature verified successfully', {
+          operation_id: gatewayRequest.operation_id,
+          signer: riskVerificationResult.signer
+        });
+      }
+
+      next();
+    } catch (error) {
+      logger.error('Risk control verification error', { error, operation_id: req.gatewayRequest?.operation_id });
+      return res.status(500).json({
+        success: false,
+        error: {
+          code: 'RISK_CONTROL_VERIFICATION_ERROR',
+          message: 'Failed to verify risk control signature',
+          details: error instanceof Error ? error.message : 'Unknown error'
+        }
+      });
+    }
+  };
+
+  validateBatchRequest = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    try {
+      const batchRequest = req.body as BatchGatewayRequest;
+
+      // 验证必要字段
+      if (!batchRequest.operation_id ||
+          !batchRequest.operation_type ||
+          !batchRequest.operations ||
+          !Array.isArray(batchRequest.operations) ||
+          batchRequest.operations.length === 0 ||
+          !batchRequest.business_signature ||
+          !batchRequest.timestamp) {
+        return res.status(400).json({
+          success: false,
+          error: {
+            code: 'INVALID_BATCH_REQUEST',
+            message: 'Missing required fields for batch operation',
+            details: 'operation_id, operation_type, operations (array), business_signature, and timestamp are required'
+          }
+        });
+      }
+
+      // 验证每个操作的必要字段
+      for (let i = 0; i < batchRequest.operations.length; i++) {
+        const op = batchRequest.operations[i];
+        if (!op.table || !op.action) {
+          return res.status(400).json({
+            success: false,
+            error: {
+              code: 'INVALID_OPERATION',
+              message: `Invalid operation at index ${i}`,
+              details: 'Each operation must have table and action fields'
+            }
+          });
+        }
+
+        // 检查批量操作中是否包含敏感表操作
+        if (isSensitiveOperation(op.table, op.action)) {
+          if (batchRequest.operation_type !== 'sensitive') {
+            const reason = getSensitiveReason(op.table);
+            logger.warn('Batch operation contains sensitive table operation but not marked as sensitive', {
+              operation_id: batchRequest.operation_id,
+              table: op.table,
+              action: op.action
+            });
+
+            return res.status(400).json({
+              success: false,
+              error: {
+                code: 'INVALID_OPERATION_TYPE',
+                message: `Batch operation contains sensitive table operation`,
+                details: `Operation at index ${i} (${op.action.toUpperCase()} on ${op.table}) requires the entire batch to be marked as operation_type: 'sensitive'. Reason: ${reason}`
+              }
+            });
+          }
+        }
+      }
+
+      // 验证时间戳（1 分钟窗口）
+      const now = Date.now();
+      const requestTime = batchRequest.timestamp;
+      const timeDiff = Math.abs(now - requestTime);
+      const maxTimeDiff = 60 * 1000; // 60 seconds
+
+      if (timeDiff > maxTimeDiff) {
+        return res.status(400).json({
+          success: false,
+          error: {
+            code: 'TIMESTAMP_EXPIRED',
+            message: 'Request timestamp is too old or too far in the future',
+            details: `Time difference: ${timeDiff}ms, max allowed: ${maxTimeDiff}ms`
+          }
+        });
+      }
+
+      // 验证operation_id作为nonce（防重放攻击）
+      const isOperationIdValid = await this.operationIdService.validateAndRecordOperationId(
+        batchRequest.operation_id,
+        batchRequest.timestamp
+      );
+
+      if (!isOperationIdValid) {
+        logger.warn('Operation ID validation failed - possible replay attack', {
+          operation_id: batchRequest.operation_id
+        });
+
+        return res.status(400).json({
+          success: false,
+          error: {
+            code: 'DUPLICATE_OPERATION_ID',
+            message: 'Operation ID has already been used',
+            details: 'This operation_id has already been used. Possible replay attack detected.'
+          }
+        });
+      }
+
+      req.batchGatewayRequest = batchRequest;
+      next();
+    } catch (error) {
+      logger.error('Batch request validation failed', { error, body: req.body });
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'BATCH_REQUEST_VALIDATION_ERROR',
+          message: 'Failed to validate batch request',
+          details: error instanceof Error ? error.message : 'Unknown error'
+        }
+      });
+    }
+  };
+
+  verifyBatchBusinessSignature = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    try {
+      const batchRequest = req.batchGatewayRequest!;
+
+      // 创建签名负载
+      const signaturePayload: any = {
+        operation_id: batchRequest.operation_id,
+        operation_type: batchRequest.operation_type,
+        operations: batchRequest.operations,
+        timestamp: batchRequest.timestamp
+      };
+
+      // 验证业务签名（自动识别签名者）
+      const verificationResult = this.verifier.verifySignature(
+        signaturePayload as any,
+        batchRequest.business_signature
+      );
+
+      if (!verificationResult.valid) {
+        logger.warn('Batch business signature verification failed', {
+          operation_id: batchRequest.operation_id,
+          operation_count: batchRequest.operations.length
+        });
+
+        return res.status(401).json({
+          success: false,
+          error: {
+            code: 'BATCH_SIGNATURE_VERIFICATION_FAILED',
+            message: 'Batch business signature verification failed',
+            details: 'The provided signature is invalid'
+          }
+        });
+      }
+
+      logger.info('Batch business signature verified successfully', {
+        operation_id: batchRequest.operation_id,
+        signer: verificationResult.signer,
+        operation_count: batchRequest.operations.length
+      });
+
+      next();
+    } catch (error) {
+      logger.error('Batch signature verification error', { error, operation_id: req.batchGatewayRequest?.operation_id });
+      return res.status(500).json({
+        success: false,
+        error: {
+          code: 'BATCH_SIGNATURE_VERIFICATION_ERROR',
+          message: 'Failed to verify batch signature',
+          details: error instanceof Error ? error.message : 'Unknown error'
+        }
+      });
+    }
+  };
+
+  verifyBatchRiskControlSignature = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    try {
+      const batchRequest = req.batchGatewayRequest!;
+
+      // 检查是否需要风控签名（敏感操作）
+      if (batchRequest.operation_type === 'sensitive') {
+        // 1. 验证必需字段 - 敏感操作必须有风控签名
+        if (!batchRequest.risk_signature) {
+          logger.error('Missing risk signature for sensitive batch operation', {
+            operation_id: batchRequest.operation_id,
+            operation_count: batchRequest.operations.length
+          });
+
+          return res.status(400).json({
+            success: false,
+            error: {
+              code: 'MISSING_RISK_SIGNATURE',
+              message: 'Risk signature is required for sensitive batch operations',
+              details: 'Sensitive operations must include risk_signature field'
+            }
+          });
+        }
+
+        // 2. 检查风控系统是否有配置的公钥
+        if (!this.verifier.hasPublicKey('risk')) {
+          return res.status(500).json({
+            success: false,
+            error: {
+              code: 'NO_RISK_PUBLIC_KEY',
+              message: 'No public key configured for risk control system',
+              details: 'Risk control public key must be configured in environment variables'
+            }
+          });
+        }
+
+        // 3. 创建签名负载（批量操作）
+        const riskSignaturePayload: any = {
+          operation_id: batchRequest.operation_id,
+          operation_type: batchRequest.operation_type,
+          operations: batchRequest.operations,
+          timestamp: batchRequest.timestamp
+        };
+
+        // 4. 验证风控签名（指定 risk 签名者）
+        const riskVerificationResult = this.verifier.verifySignature(
+          riskSignaturePayload as any,
+          batchRequest.risk_signature,
+          'risk'  // 指定预期签名者为 risk，避免遍历所有公钥
+        );
+
+        if (!riskVerificationResult.valid) {
+          logger.warn('Risk control signature verification failed for batch operation', {
+            operation_id: batchRequest.operation_id,
+            operation_count: batchRequest.operations.length
+          });
+
+          return res.status(401).json({
+            success: false,
+            error: {
+              code: 'RISK_SIGNATURE_VERIFICATION_FAILED',
+              message: 'Risk control signature verification failed',
+              details: 'The provided risk signature is invalid'
+            }
+          });
+        }
+
+        logger.info('Risk control signature verified successfully for batch operation', {
+          operation_id: batchRequest.operation_id,
+          signer: riskVerificationResult.signer,
+          operation_count: batchRequest.operations.length
+        });
+      }
+
+      next();
+    } catch (error) {
+      logger.error('Batch risk control verification error', { error, operation_id: req.batchGatewayRequest?.operation_id });
+      return res.status(500).json({
+        success: false,
+        error: {
+          code: 'RISK_CONTROL_VERIFICATION_ERROR',
+          message: 'Failed to verify risk control signature for batch operation',
+          details: error instanceof Error ? error.message : 'Unknown error'
+        }
+      });
+    }
+  };
+}
