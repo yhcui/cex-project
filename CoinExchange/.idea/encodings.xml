@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="Encoding">
+    <file url="file://$PROJECT_DIR$/00_framework/admin/src/main/java" charset="UTF-8" />
+    <file url="file://$PROJECT_DIR$/00_framework/bitrade-job/src/main/java" charset="UTF-8" />
+    <file url="file://$PROJECT_DIR$/00_framework/chat/src/main/java" charset="UTF-8" />
+    <file url="file://$PROJECT_DIR$/00_framework/cloud/src/main/java" charset="UTF-8" />
+    <file url="file://$PROJECT_DIR$/00_framework/core/src/main/java" charset="UTF-8" />
+    <file url="file://$PROJECT_DIR$/00_framework/exchange-api/src/main/java" charset="UTF-8" />
+    <file url="file://$PROJECT_DIR$/00_framework/exchange-core/src/main/java" charset="UTF-8" />
+    <file url="file://$PROJECT_DIR$/00_framework/exchange/src/main/java" charset="UTF-8" />
+    <file url="file://$PROJECT_DIR$/00_framework/market/src/main/java" charset="UTF-8" />
+    <file url="file://$PROJECT_DIR$/00_framework/otc-api/src/main/java" charset="UTF-8" />
+    <file url="file://$PROJECT_DIR$/00_framework/otc-core/src/main/java" charset="UTF-8" />
+    <file url="file://$PROJECT_DIR$/00_framework/src/main/java" charset="UTF-8" />
+    <file url="file://$PROJECT_DIR$/00_framework/src/main/resources" charset="UTF-8" />
+    <file url="file://$PROJECT_DIR$/00_framework/ucenter-api/src/main/java" charset="UTF-8" />
+    <file url="file://$PROJECT_DIR$/00_framework/wallet/src/main/java" charset="UTF-8" />
+    <file url="file://$PROJECT_DIR$/04_Web_Admin/安装手册.txt" charset="GB2312" />
+  </component>
+</project>
