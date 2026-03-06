@@ -166,6 +166,7 @@ export class ViemClient {
 
   /**
    * 解析 ERC20 转账事件
+   * 方法用于解析 ERC20 代币转账事件的日志，将区块链上的原始日志数据转换为可读的转账信息（发送方、接收方、转账金额）。
    */
   parseERC20Transfer(log: Log): {
     from: string;
@@ -173,15 +174,60 @@ export class ViemClient {
     value: bigint;
   } | null {
     try {
+      /*
+        ABI（Application Binary Interface，应用二进制接口）是 以太坊智能合约与外部世界交互的标准接口定义。
+        智能合约编译后是 字节码（Bytecode），外部程序无法直接理解。ABI 提供了 人类可读的接口描述，让外部程序知道如何与合约交互。
+
+        日志数据结构
+        Log {
+          data: "0x00000000000000000000000000000000000000000000000000000000000f4240",  // value = 1000000
+          topics: [
+            "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",  // Transfer 事件签名
+            "0x000000000000000000000000742d35Cc6634C0532925a3b844Bc9e7595f8bE",  // from 地址
+            "0x0000000000000000000000008Ba1f109551bD432803012645Ac136c4a8b5E"   // to 地址
+          ]
+        }
+
+      */
       // ERC20 Transfer 事件的 ABI
+      /*
+        parseAbiItem 是 viem 库 提供的工具函数，用于将 Solidity ABI 字符串 解析为 JavaScript/TypeScript 可识别的 ABI 项对象.
+        aib: Solidity ABI 定义的字符串
+
+        解析结果： {
+          type: 'event',
+          name: 'Transfer',
+          inputs: [
+            { name: 'from', type: 'address', indexed: true },
+            { name: 'to', type: 'address', indexed: true },
+            { name: 'value', type: 'uint256', indexed: false }
+          ]
+        }
+        为什么需要 parseAbiItem
+
+        ABI（Application Binary Interface）是以太坊智能合约与外部交互的接口定义，包含：
+        1、函数签名（名称、参数类型、返回值）
+        2、事件定义（名称、参数、是否 indexed）
+
+
+        decodeEventLog 需要知道事件的结构才能正确解析日志数据：
+
+        Solidity 合约          parseAbiItem          decodeEventLog
+            ↓                      ↓                      ↓
+        event Transfer(...)  →  ABI 对象  →  解析日志数据  →  可读的转账信息
+
+
+      */
       const transferEvent = parseAbiItem('event Transfer(address indexed from, address indexed to, uint256 value)');
-      
+
+      // 步骤 2: 使用 viem 的 decodeEventLog 解码
       const decoded = decodeEventLog({
         abi: [transferEvent],
         data: log.data,
         topics: log.topics
       });
       
+      // 步骤 3: 提取解析结果
       if (decoded.eventName === 'Transfer') {
         return {
           from: decoded.args.from as string,

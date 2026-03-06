@@ -439,7 +439,7 @@ export class BlockScanner {
   }
 
   /**
-   * 扫描新区块（定时任务）
+   *  
    */
   private async scanNewBlocks(): Promise<void> {
     try {
